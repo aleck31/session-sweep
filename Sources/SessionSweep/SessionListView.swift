@@ -21,12 +21,17 @@ struct SessionListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            headerBar
+            // Fixed-height header (title + actions) so its divider lines up with
+            // the sidebar's fixed header divider across the split view.
+            VStack(spacing: 0) {
+                titleHeader
+                actionBar
+                Spacer(minLength: 0)
+            }
+            .frame(height: Layout.headerHeight)
             Divider()
             table
         }
-        .navigationTitle(group.displayName)
-        .navigationSubtitle(group.cwd)
         .task(id: group.cwd) {
             // Count messages for this group as soon as it's shown (covers the
             // initial auto-selection, which doesn't fire onChange).
@@ -51,30 +56,93 @@ struct SessionListView: View {
 
     // MARK: Header / batch actions
 
-    private var headerBar: some View {
-        HStack {
-            Text("\(group.sessions.count) sessions · \(group.totalSize.humanSize)")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button {
-                openCwdInFinder()
-            } label: {
-                Label("Open in Finder", systemImage: "folder")
+    /// Row 1 — the directory name + full path with directory-level actions
+    /// (Open in Finder, Rescan this directory). The window title bar is
+    /// reserved for the app name, so this lives in the content area.
+    private var titleHeader: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 8) {
+                Text(group.displayName)
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                // Open in Finder sits right next to the directory name it acts
+                // on. Explicitly dim it when the cwd is gone — borderless icon
+                // buttons barely change on their own when disabled.
+                Button {
+                    openCwdInFinder()
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(cwdExists ? Color.secondary : Color.secondary.opacity(0.35))
+                .disabled(!cwdExists)
+                .help(cwdExists ? "Reveal in Finder" : "Directory no longer exists")
+
+                if !group.cwdExists {
+                    Text("missing")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.15), in: Capsule())
+                }
+            }
+            // Path + volume summary on one descriptive line.
+            HStack(spacing: 6) {
+                Text(group.cwd)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                Text("· \(group.sessions.count) sessions · \(group.totalSize.humanSize)")
+                    .foregroundStyle(.tertiary)
+                    .layoutPriority(1)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+    }
+
+    /// Row 2 — selection on the left, the destructive Delete action on the right.
+    private var actionBar: some View {
+        HStack(spacing: 10) {
+            Button(allSelected ? "Deselect All" : "Select All") {
+                toggleSelectAll()
             }
             .controlSize(.small)
-            .disabled(!cwdExists)
-            .help(cwdExists ? "Reveal \(group.cwd) in Finder" : "Directory no longer exists")
-            Spacer()
+            .disabled(group.sessions.isEmpty)
+
             if !selection.isEmpty {
                 Text("\(selection.count) selected")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if !selection.isEmpty {
                 Button(role: .destructive) {
                     requestDelete(selectedSessions())
                 } label: {
                     Label("Delete Selected", systemImage: "trash")
                 }
+                .controlSize(.small)
             }
+
+            Button {
+                store.reloadCwd(group.cwd)
+            } label: {
+                if store.reloadingCwds.contains(group.cwd) {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+            .controlSize(.small)
+            .disabled(store.reloadingCwds.contains(group.cwd))
+            .help("Rescan this directory")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -95,6 +163,7 @@ struct SessionListView: View {
                         .lineLimit(1)
                 }
             }
+            .width(min: 200, ideal: 320)
             TableColumn("Agent", value: \.agent) { Text($0.agent).foregroundStyle(.secondary) }
                 .width(min: 80, ideal: 100)
             TableColumn("Messages", sortUsing: KeyPathComparator(\ChatSession.messageCount)) { session in
@@ -185,6 +254,20 @@ struct SessionListView: View {
     /// Reveal a session's underlying file(s) in Finder, selected.
     private func revealInFinder(_ session: ChatSession) {
         NSWorkspace.shared.activateFileViewerSelecting(session.fileURLs)
+    }
+
+    // MARK: Selection
+
+    private var allSelected: Bool {
+        !group.sessions.isEmpty && selection.count == group.sessions.count
+    }
+
+    private func toggleSelectAll() {
+        if allSelected {
+            selection.removeAll()
+        } else {
+            selection = Set(group.sessions.map(\.id))
+        }
     }
 
     // MARK: Delete flow

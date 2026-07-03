@@ -17,17 +17,7 @@ struct ContentView: View {
                 EmptyDetailView()
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    store.reload()
-                } label: {
-                    Label("Rescan", systemImage: "arrow.clockwise")
-                }
-                .disabled(store.isScanning)
-                .help("Rescan all agents")
-            }
-        }
+        .navigationTitle("SessionSweep")
         .onChange(of: store.groups) { _, groups in
             // Keep a valid selection after a rescan.
             if selectedCwd == nil || !groups.contains(where: { $0.cwd == selectedCwd }) {

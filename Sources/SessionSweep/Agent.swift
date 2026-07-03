@@ -1,5 +1,36 @@
 import Foundation
 
+/// Stream a file line by line, calling `handle` for each until it returns
+/// false (stop) or EOF. Reads in chunks so we never load a huge file (some
+/// Claude jsonl are tens of MB with a few enormous lines) fully into memory.
+func forEachLine(of url: URL, _ handle: (String) -> Bool) {
+    guard let fh = try? FileHandle(forReadingFrom: url) else { return }
+    defer { try? fh.close() }
+
+    var buffer = Data()
+    let newline = UInt8(ascii: "\n")
+    let chunkSize = 64 * 1024
+
+    while true {
+        // Emit any complete lines already in the buffer.
+        while let nl = buffer.firstIndex(of: newline) {
+            let lineData = buffer[buffer.startIndex..<nl]
+            buffer.removeSubrange(buffer.startIndex...nl)
+            if let line = String(data: lineData, encoding: .utf8), !handle(line) {
+                return
+            }
+        }
+        guard let chunk = try? fh.read(upToCount: chunkSize), !chunk.isEmpty else {
+            // EOF — hand over any trailing line without a newline.
+            if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
+                _ = handle(line)
+            }
+            return
+        }
+        buffer.append(chunk)
+    }
+}
+
 /// An AI agent application whose chat sessions live on disk. Add support for a
 /// new agent by implementing this. (Named `Agent`, not `Provider`, to avoid
 /// confusion with LLM/model providers — these are AI applications.)
@@ -8,14 +39,15 @@ protocol Agent {
     var name: String { get }
     /// Whether this agent is installed on the machine (drives auto-discovery).
     var isInstalled: Bool { get }
-    /// Scan and return every session this agent has stored.
-    /// `messageCount` may be left nil here when counting is expensive;
-    /// `countMessages(for:)` fills it in on demand.
+    /// Scan and return every session this agent has stored. Expensive fields
+    /// (message count, and for some agents the title) may be left nil/placeholder
+    /// here; `enrich(_:)` fills them in on demand.
     func scan() -> [ChatSession]
-    /// Count user + assistant messages for one session. Potentially slow
-    /// (reads the full conversation file), so callers run it off-main and
-    /// only when the session is about to be shown.
-    func countMessages(for session: ChatSession) -> Int
+    /// Fill in a session's lazily-computed fields (message count, and title if
+    /// scan couldn't get it cheaply) in a single file read. Potentially slow,
+    /// so callers run it off-main and only when the session is about to be shown.
+    /// Returns an updated copy; the input is returned unchanged if nothing to do.
+    func enrich(_ session: ChatSession) -> ChatSession
 }
 
 // MARK: - Kiro
@@ -99,25 +131,30 @@ struct KiroAgent: Agent {
         )
     }
 
-    /// Count messages by streaming the `.jsonl` event log and tallying the
+    /// Kiro already has the title from `.json` at scan time, so enrich only
+    /// fills the message count by streaming the `.jsonl` event log, tallying
     /// `Prompt` (user) and `AssistantMessage` events. Tool results and
     /// compaction events are excluded — they aren't conversation messages.
-    func countMessages(for session: ChatSession) -> Int {
-        guard let jsonlURL = session.fileURLs.first(where: { $0.pathExtension == "jsonl" }),
-              let content = try? String(contentsOf: jsonlURL, encoding: .utf8)
-        else { return 0 }
-
+    func enrich(_ session: ChatSession) -> ChatSession {
+        guard let jsonlURL = session.fileURLs.first(where: { $0.pathExtension == "jsonl" }) else {
+            var updated = session
+            updated.messageCount = 0
+            return updated
+        }
         var count = 0
-        for line in content.split(separator: "\n") {
+        forEachLine(of: jsonlURL) { line in
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
+            else { return true }
             switch obj["kind"] as? String {
             case "Prompt", "AssistantMessage": count += 1
             default: break
             }
+            return true
         }
-        return count
+        var updated = session
+        updated.messageCount = count
+        return updated
     }
 
     /// True only if the lock exists AND its PID is a live process.
@@ -217,52 +254,38 @@ struct ClaudeCodeAgent: Agent {
         return result
     }
 
+    /// Fast scan: read only the file's head to get `cwd` / `sessionId` (they
+    /// appear within the first few lines). Title and message count are left
+    /// nil and filled in lazily — the full file (often tens of MB) is never
+    /// parsed here.
     private func parse(file: URL) -> ChatSession? {
         let v = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let fileSize = Int64(v?.fileSize ?? 0)
         let modified = v?.contentModificationDate ?? .distantPast
 
-        guard let content = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-        let lines = content.split(separator: "\n").map(String.init)
-        guard !lines.isEmpty else { return nil }
-
         var cwd: String?
         var sessionId: String?
-        var aiTitle: String?
-        var firstUserText: String?
-        var messageCount = 0
+        var sawAnyLine = false
 
-        for line in lines {
+        forEachLine(of: file) { line in
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-
+            else { return true } // skip unparsable line, keep going
+            sawAnyLine = true
             if cwd == nil, let c = obj["cwd"] as? String { cwd = c }
             if sessionId == nil, let s = obj["sessionId"] as? String { sessionId = s }
-
-            switch obj["type"] as? String {
-            case "ai-title":
-                if let t = obj["aiTitle"] as? String { aiTitle = t }
-            case "user":
-                messageCount += 1
-                if firstUserText == nil { firstUserText = Self.extractText(from: obj["message"]) }
-            case "assistant":
-                messageCount += 1
-            default:
-                break
-            }
+            // Stop as soon as we have both — no need to read the rest.
+            return cwd == nil || sessionId == nil
         }
+        guard sawAnyLine else { return nil }
 
-        let title = aiTitle
-            ?? firstUserText?.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60).description
-            ?? file.deletingPathExtension().lastPathComponent
-
+        let stem = file.deletingPathExtension().lastPathComponent
         return ChatSession(
-            id: sessionId ?? file.deletingPathExtension().lastPathComponent,
+            id: sessionId ?? stem,
             agent: name,
             cwd: cwd ?? "(unknown)",
-            title: title.isEmpty ? "(untitled)" : title,
-            messageCount: messageCount,
+            title: stem, // placeholder; real title resolved lazily
+            messageCount: nil, // counted lazily on demand
             fileSize: fileSize,
             modifiedAt: modified,
             locked: false,
@@ -271,11 +294,36 @@ struct ClaudeCodeAgent: Agent {
         )
     }
 
-    /// Claude Code files are read in full during `scan`, so the count is
-    /// already known; recompute from the file as a fallback if it was nil.
-    func countMessages(for session: ChatSession) -> Int {
-        if let n = session.messageCount { return n }
-        return parse(file: session.primaryURL)?.messageCount ?? 0
+    /// One pass over the file: tally user/assistant messages and resolve the
+    /// title (`ai-title`, else first user message). Fills both lazy fields.
+    func enrich(_ session: ChatSession) -> ChatSession {
+        var count = 0
+        var aiTitle: String?
+        var firstUserText: String?
+        forEachLine(of: session.primaryURL) { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return true }
+            switch obj["type"] as? String {
+            case "ai-title":
+                if let t = obj["aiTitle"] as? String { aiTitle = t }
+            case "user":
+                count += 1
+                if firstUserText == nil { firstUserText = Self.extractText(from: obj["message"]) }
+            case "assistant":
+                count += 1
+            default:
+                break
+            }
+            return true
+        }
+        let resolved = aiTitle
+            ?? firstUserText?.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60).description
+            ?? session.primaryURL.deletingPathExtension().lastPathComponent
+        var updated = session
+        updated.messageCount = count
+        updated.title = resolved.isEmpty ? "(untitled)" : resolved
+        return updated
     }
 
     /// Extract plain text from a `message` field (content may be a string or an array).

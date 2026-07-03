@@ -17,6 +17,16 @@ final class SessionStore: ObservableObject {
     /// cwds whose message counts are currently being computed in the background.
     @Published private(set) var countingCwds = Set<String>()
 
+    /// cwds currently being re-scanned via `reloadCwd` (drives a per-dir spinner).
+    @Published private(set) var reloadingCwds = Set<String>()
+
+    /// Cache of enriched sessions keyed by file URL, tagged with the file's
+    /// mtime at enrichment time. A scan that finds the same URL with an
+    /// unchanged mtime reuses the cached session — skipping the expensive
+    /// re-read of title + message count. This makes both global and per-cwd
+    /// refresh near-instant for files that haven't changed.
+    private var cache: [URL: (mtime: Date, session: ChatSession)] = [:]
+
     /// Agents detected on this machine (for an "N agents discovered" line).
     var installedAgents: [String] {
         agents.filter(\.isInstalled).map(\.name)
@@ -26,25 +36,85 @@ final class SessionStore: ObservableObject {
         agents.first { $0.name == name }
     }
 
-    /// Re-scan all installed agents off the main thread, then publish.
+    /// Reuse the cached enriched session when the file is unchanged (same mtime);
+    /// otherwise return the freshly-scanned (not-yet-enriched) session as-is.
+    private func merged(_ scanned: ChatSession) -> ChatSession {
+        if let hit = cache[scanned.primaryURL], hit.mtime == scanned.modifiedAt {
+            return hit.session
+        }
+        return scanned
+    }
+
+    /// Record an enriched session in the cache under its current mtime.
+    private func store(_ session: ChatSession) {
+        cache[session.primaryURL] = (session.modifiedAt, session)
+    }
+
+    /// Full re-scan of all installed agents off the main thread. Unchanged
+    /// files keep their cached enrichment; the cache is pruned to what still
+    /// exists on disk.
     func reload() {
         isScanning = true
         let agents = self.agents
         DispatchQueue.global(qos: .userInitiated).async {
-            let sessions = agents
-                .filter(\.isInstalled)
-                .flatMap { $0.scan() }
-            let grouped = Self.group(sessions)
+            let scanned = agents.filter(\.isInstalled).flatMap { $0.scan() }
             DispatchQueue.main.async {
-                self.groups = grouped
+                let merged = scanned.map(self.merged)
+                self.groups = Self.group(merged)
+                // Drop cache entries for files that no longer exist.
+                let live = Set(scanned.map(\.primaryURL))
+                self.cache = self.cache.filter { live.contains($0.key) }
                 self.isScanning = false
             }
         }
     }
 
-    /// Count messages for every not-yet-counted session in one cwd group,
-    /// off the main thread, then patch the results back into `groups`. Called
-    /// when the user selects a directory, so only what's on screen is read.
+    /// Re-scan only the given cwd: pick up session files added/removed there and
+    /// refresh this group — reusing cached enrichment for unchanged files, and
+    /// eagerly enriching new/changed ones. Other groups are untouched.
+    func reloadCwd(_ cwd: String) {
+        guard !reloadingCwds.contains(cwd) else { return }
+        reloadingCwds.insert(cwd)
+        let agents = self.agents
+        let snapshot = cache
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Scanning is per-agent, not per-cwd, so scan then keep this cwd.
+            let scanned = agents
+                .filter(\.isInstalled)
+                .flatMap { $0.scan() }
+                .filter { $0.cwd == cwd }
+
+            // Reuse cache for unchanged files; enrich the rest now.
+            var refreshed: [ChatSession] = []
+            for s in scanned {
+                if let hit = snapshot[s.primaryURL], hit.mtime == s.modifiedAt {
+                    refreshed.append(hit.session)
+                } else if let agent = self.agent(named: s.agent) {
+                    refreshed.append(agent.enrich(s))
+                } else {
+                    refreshed.append(s)
+                }
+            }
+            refreshed.sort { $0.modifiedAt > $1.modifiedAt }
+
+            DispatchQueue.main.async {
+                self.reloadingCwds.remove(cwd)
+                refreshed.forEach(self.store)
+                if let gi = self.groups.firstIndex(where: { $0.cwd == cwd }) {
+                    if refreshed.isEmpty {
+                        self.groups.remove(at: gi) // all sessions gone → drop group
+                    } else {
+                        self.groups[gi] = ProjectGroup(cwd: cwd, sessions: refreshed)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enrich every not-yet-counted session in one cwd group (message count and,
+    /// for some agents, the real title), off the main thread, then patch the
+    /// results back in. Called when the user selects a directory, so only what's
+    /// on screen is read.
     func ensureMessageCounts(forCwd cwd: String) {
         guard let group = groups.first(where: { $0.cwd == cwd }) else { return }
         let pending = group.sessions.filter { $0.messageCount == nil }
@@ -52,25 +122,26 @@ final class SessionStore: ObservableObject {
 
         countingCwds.insert(cwd)
         DispatchQueue.global(qos: .userInitiated).async {
-            var counts: [URL: Int] = [:]
+            var enriched: [URL: ChatSession] = [:]
             for session in pending {
                 guard let agent = self.agent(named: session.agent) else { continue }
-                counts[session.primaryURL] = agent.countMessages(for: session)
+                enriched[session.primaryURL] = agent.enrich(session)
             }
             DispatchQueue.main.async {
-                self.applyCounts(counts, toCwd: cwd)
+                self.apply(enriched, toCwd: cwd)
+                enriched.values.forEach(self.store)
                 self.countingCwds.remove(cwd)
             }
         }
     }
 
-    /// Patch computed counts into the matching sessions of one group.
-    private func applyCounts(_ counts: [URL: Int], toCwd cwd: String) {
+    /// Patch enriched sessions into the matching rows of one group.
+    private func apply(_ enriched: [URL: ChatSession], toCwd cwd: String) {
         guard let gi = groups.firstIndex(where: { $0.cwd == cwd }) else { return }
         for si in groups[gi].sessions.indices {
             let url = groups[gi].sessions[si].primaryURL
-            if let n = counts[url] {
-                groups[gi].sessions[si].messageCount = n
+            if let e = enriched[url] {
+                groups[gi].sessions[si] = e
             }
         }
     }
@@ -103,6 +174,7 @@ final class SessionStore: ObservableObject {
                 return "Failed to delete \(url.lastPathComponent): \(error.localizedDescription)"
             }
         }
+        cache.removeValue(forKey: session.primaryURL) // stop caching a deleted file
         return nil
     }
 }
